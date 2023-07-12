@@ -85,5 +85,6 @@ def monkey_patch(state_path: Optional[str]) -> None:
     for fork_name in (
         "paris",
         "shanghai",
+        "cancun",
     ):
         monkey_patch_optimized_state_db(fork_name, state_path)
