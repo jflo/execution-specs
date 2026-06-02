@@ -498,6 +498,14 @@ class T8N(Load):
                 data=block_env.parent_beacon_block_root,
             )
 
+        # Execute sealed ticket transactions top-of-block (EIP-8184).
+        if self.fork.has_is_sealed_ticket_ordering_valid:
+            self.fork.process_sealed_tickets(
+                self.env.sealed_transaction_contexts,
+                block_env,
+                block_output,
+            )
+
         for tx_index, (original_idx, tx) in enumerate(
             zip(
                 self.txs.successfully_parsed,

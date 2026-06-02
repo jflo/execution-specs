@@ -276,6 +276,7 @@ class Result:
     block_access_list: Optional[Any] = None
     block_access_list_hash: Optional[Hash32] = None
     is_inclusion_list_satisfied: Optional[bool] = None
+    is_sealed_ticket_ordering_valid: Optional[bool] = None
 
     def get_receipts_from_output(
         self,
@@ -358,6 +359,11 @@ class Result:
         if hasattr(block_output, "is_inclusion_list_satisfied"):
             self.is_inclusion_list_satisfied = (
                 block_output.is_inclusion_list_satisfied
+            )
+
+        if hasattr(block_output, "is_sealed_ticket_ordering_valid"):
+            self.is_sealed_ticket_ordering_valid = (
+                block_output.is_sealed_ticket_ordering_valid
             )
 
     def json_encode_receipts(self) -> Any:
@@ -454,5 +460,10 @@ class Result:
 
         if self.is_inclusion_list_satisfied is not None:
             data["isInclusionListSatisfied"] = self.is_inclusion_list_satisfied
+
+        if self.is_sealed_ticket_ordering_valid is not None:
+            data["isSealedTicketOrderingValid"] = (
+                self.is_sealed_ticket_ordering_valid
+            )
 
         return data

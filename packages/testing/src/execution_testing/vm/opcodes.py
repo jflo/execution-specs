@@ -2225,6 +2225,35 @@ class Opcodes(Opcode, Enum):
     Source: [EIP-7516](https://eips.ethereum.org/EIPS/eip-7516)
     """
 
+    SLOTNUM = Opcode(0x4B, popped_stack_items=0, pushed_stack_items=1)
+    """
+    SLOTNUM() = slot
+    ----
+
+    Description
+    ----
+    Returns the slot number of the block in which this transaction's sealed
+    ticket commitment was included. Returns 0 for ordinary transactions.
+
+    Inputs
+    ----
+    - None
+
+    Outputs
+    ----
+    - slot: commitment slot number (0 for non-sealed transactions)
+
+    Fork
+    ----
+    Amsterdam
+
+    Gas
+    ----
+    2
+
+    Source: [EIP-8184](https://eips.ethereum.org/EIPS/eip-8184)
+    """
+
     POP = Opcode(0x50, popped_stack_items=1)
     """
     POP()
