@@ -93,6 +93,8 @@ A9
 AA
 AB
 ab
+AEAD
+aead
 AC
 AccessListType
 Account1
@@ -271,6 +273,8 @@ ce
 CF
 cf
 CFI'd
+ChaCha
+chacha20poly1305
 chainid
 ChainIDType
 changelog
@@ -278,6 +282,7 @@ chdir
 checkable
 chfast
 ci
+ciphertext
 ckzg
 ClassDef
 classdict
@@ -364,6 +369,8 @@ dc
 dd
 DE
 de
+DEM
+dem
 dedent
 delegatecall
 delegatecalling
@@ -756,6 +763,8 @@ longreprtext
 lru
 lt
 LTS
+LUCID
+lucid
 
 macOS
 mainnet
@@ -906,6 +915,7 @@ Point2
 Point3
 Point3D
 Pomerantz
+Poly1305
 pop
 popen
 POS
@@ -1069,6 +1079,8 @@ sandboxed
 sar
 sbc
 sdiv
+sealed
+SealedTicketTransaction
 secp256k1
 secp256k1b
 secp256k1n
@@ -1108,6 +1120,8 @@ signextend
 simlimit
 sload
 slot1
+slotnum
+SLOTNUM
 slot2
 slt
 smod
@@ -1210,6 +1224,8 @@ timestamp
 tlnp
 tload
 tmp
+tob
+TOB
 toc
 todo
 toml

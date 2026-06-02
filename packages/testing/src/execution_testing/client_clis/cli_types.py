@@ -401,6 +401,7 @@ class Result(CamelModel):
     block_access_list: Bytes | None = None
     block_access_list_hash: Hash | None = None
     is_inclusion_list_satisfied: bool | None = None
+    is_sealed_ticket_ordering_valid: bool | None = None
     block_exception: Annotated[
         BlockExceptionWithMessage | UndefinedException | None,
         ExceptionMapperValidator,

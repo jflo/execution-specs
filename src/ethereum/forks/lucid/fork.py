@@ -1,0 +1,1749 @@
+"""
+Ethereum Specification.
+
+.. contents:: Table of Contents
+    :backlinks: none
+    :local:
+
+Introduction
+------------
+
+Entry point for the Ethereum specification.
+"""
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+from ethereum_rlp import rlp
+from ethereum_types.bytes import Bytes, Bytes32
+from ethereum_types.frozen import slotted_freezable
+from ethereum_types.numeric import U64, U256, Uint, ulen
+
+from ethereum.crypto.chacha20poly1305 import (
+    AEADDecryptionError,
+    chacha20poly1305_decrypt,
+)
+from ethereum.crypto.hash import Hash32, keccak256
+from ethereum.crypto.ssz import hash_tree_root_reveal_commitment_preimage
+from ethereum.exceptions import (
+    EthereumException,
+    GasUsedExceedsLimitError,
+    InsufficientBalanceError,
+    InvalidBlock,
+    InvalidSenderError,
+    NonceMismatchError,
+)
+from ethereum.forks.amsterdam.blocks import Header as PreviousHeader
+from ethereum.merkle_patricia_trie import root, trie_set
+from ethereum.state import (
+    EMPTY_CODE_HASH,
+    Address,
+    BlockDiff,
+    State,
+    apply_changes_to_state,
+)
+
+from . import vm
+from .block_access_lists import (
+    BlockAccessIndex,
+    BlockAccessListBuilder,
+    build_block_access_list,
+    hash_block_access_list,
+    validate_block_access_list_gas_limit,
+)
+from .blocks import Block, Header, Log, Receipt, Withdrawal, encode_receipt
+from .bloom import logs_bloom
+from .exceptions import (
+    BlobCountExceededError,
+    BlobGasLimitExceededError,
+    EmptyAuthorizationListError,
+    InsufficientMaxFeePerBlobGasError,
+    InsufficientMaxFeePerGasError,
+    InvalidBlobVersionedHashError,
+    NoBlobDataError,
+    PriorityFeeGreaterThanMaxFeeError,
+    SealedTicketDecryptionError,
+    SealedTicketFeeError,
+    TransactionTypeContractCreationError,
+)
+from .fork_types import Authorization, VersionedHash
+from .requests import (
+    CONSOLIDATION_REQUEST_TYPE,
+    DEPOSIT_REQUEST_TYPE,
+    WITHDRAWAL_REQUEST_TYPE,
+    compute_requests_hash,
+    parse_deposit_requests,
+)
+from .state_tracker import (
+    BlockState,
+    TransactionState,
+    account_exists_and_is_empty,
+    destroy_account,
+    extract_block_diff,
+    get_account,
+    get_code,
+    incorporate_tx_into_block,
+    increment_nonce,
+    set_account_balance,
+)
+from .transactions import (
+    BlobTransaction,
+    FeeMarketTransaction,
+    LegacyTransaction,
+    RegularTransaction,
+    SealedTicketTransaction,
+    SetCodeTransaction,
+    decode_transaction,
+    encode_transaction,
+    get_transaction_hash,
+    has_access_list,
+    recover_sender,
+    validate_transaction,
+)
+from .utils.hexadecimal import hex_to_address
+from .utils.message import prepare_message
+from .vm import Message
+from .vm.eoa_delegation import is_valid_delegation
+from .vm.gas import (
+    GasCosts,
+    calculate_blob_gas_price,
+    calculate_data_fee,
+    calculate_excess_blob_gas,
+    calculate_total_blob_gas,
+)
+from .vm.interpreter import MessageCallOutput, process_message_call
+
+BASE_FEE_MAX_CHANGE_DENOMINATOR = Uint(8)
+ELASTICITY_MULTIPLIER = Uint(2)
+EMPTY_OMMER_HASH = keccak256(rlp.encode([]))
+SYSTEM_ADDRESS = hex_to_address("0xfffffffffffffffffffffffffffffffffffffffe")
+BEACON_ROOTS_ADDRESS = hex_to_address(
+    "0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02"
+)
+SYSTEM_TRANSACTION_GAS = Uint(30000000)
+MAX_BLOB_GAS_PER_BLOCK = GasCosts.BLOB_SCHEDULE_MAX * GasCosts.PER_BLOB
+VERSIONED_HASH_VERSION_KZG = b"\x01"
+GWEI_TO_WEI = U256(10**9)
+
+WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
+    "0x00000961Ef480Eb55e80D19ad83579A64c007002"
+)
+CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS = hex_to_address(
+    "0x0000BBdDc7CE488642fb579F8B00f3a590007251"
+)
+HISTORY_STORAGE_ADDRESS = hex_to_address(
+    "0x0000F90827F1C53a10cb7A02335B175320002935"
+)
+MAX_BLOCK_SIZE = 10_485_760
+SAFETY_MARGIN = 2_097_152
+MAX_RLP_BLOCK_SIZE = MAX_BLOCK_SIZE - SAFETY_MARGIN
+BLOB_COUNT_LIMIT = 6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LUCID Encrypted Mempool constants (EIP-8184)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOB_GAS_FRACTION_DENOMINATOR = Uint(8)
+"""
+Fraction denominator for the top-of-block gas budget.
+
+``tob_gas_limit = block.gas_limit // TOB_GAS_FRACTION_DENOMINATOR``
+"""
+
+TOB_FEE_FRACTION = Uint(128)
+"""
+Denominator used in the unused-gas TOB-fee refund formula.
+
+``refund_tob = tob_fee * (TOB_FEE_FRACTION - 1) // TOB_FEE_FRACTION``
+"""
+
+MAX_SIGNATURE_SIZE = Uint(2**16)
+"""Maximum byte length of a sealed ticket signature."""
+
+MAX_ST_COMMITS_PER_IL = Uint(2)
+"""Maximum number of ST commitments per inclusion-list member."""
+
+MAX_STS_PER_BUNDLE = Uint(64)
+"""Maximum number of sealed transactions in a bundle."""
+
+MAX_BYTES_PER_ST = Uint(2**24 // 64)
+"""Maximum byte length of a single sealed-transaction payload."""
+
+# NOTE: IL_COMMITTEE_SIZE is a consensus-layer parameter from EIP-7805.
+# It is modelled here as an EL constant so that derived limits can be
+# computed.  The value 512 matches the committee size specified in EIP-7805.
+IL_COMMITTEE_SIZE = Uint(512)
+"""
+Inclusion-list committee size (from EIP-7805).
+
+This is a consensus-layer constant; it is defined here solely to derive the
+LUCID limits below.
+"""
+
+MAX_ST_COMMITS = MAX_ST_COMMITS_PER_IL * IL_COMMITTEE_SIZE
+"""Maximum total ST commitments across all IL members in one block."""
+
+MAX_ST_TICKETS = MAX_ST_COMMITS * MAX_STS_PER_BUNDLE
+"""Maximum total sealed tickets that may be executed in one block."""
+
+
+@dataclass
+class SealedTransactionContext:
+    """
+    Test-supplied execution context for one sealed transaction.
+
+    Groups all information the EL needs to validate and execute a decrypted
+    sealed transaction without implementing the consensus-layer key
+    dissemination machinery.
+
+    Introduced in [EIP-8184].
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+    """
+
+    ticket: SealedTicketTransaction
+    """The sealed ticket scheduling this execution."""
+
+    ticket_sender: Address
+    """Address recovered from the ticket's ECDSA signature."""
+
+    plaintext_tx: FeeMarketTransaction
+    """
+    Decrypted EIP-1559 transaction.  Must satisfy:
+    ``max_priority_fee_per_gas == 0``, ``max_fee_per_gas == 0``, and
+    ``gas == ticket.gas_limit``.
+    """
+
+    ciphertext_envelope: Bytes
+    """
+    Full ciphertext envelope bytes.  Used to verify
+    ``ticket.ciphertext_hash == keccak256(ciphertext_envelope)``.
+    """
+
+    k_dem: Bytes32
+    """
+    Data-encapsulation-mechanism key.  Used to verify
+    ``ticket.key_commitment == keccak256(k_dem)``.
+    """
+
+    commitment_slot: U64
+    """
+    Slot number of the block that contained this ticket's ST commitment.
+    Returned by the ``SLOTNUM`` opcode during decrypted-transaction execution.
+    """
+
+    commitment_index: Uint
+    """
+    Index of this ticket's ST commitment within the scheduling block's IL.
+    Used to enforce ``max_preceding_commitments`` ordering constraints.
+    """
+
+
+@slotted_freezable
+@dataclass
+class ChainContext:
+    """
+    Chain context needed for block execution.
+    """
+
+    chain_id: U64
+    """Identify the chain for transaction signature recovery."""
+
+    block_hashes: List[Hash32]
+    """Recent ancestor hashes (up to 256) for the ``BLOCKHASH`` opcode."""
+
+    parent_header: Header | PreviousHeader
+    """Parent header used for header validation and system contracts."""
+
+
+@dataclass
+class BlockChain:
+    """
+    History and current state of the block chain.
+    """
+
+    blocks: List[Block]
+    state: State
+    chain_id: U64
+
+
+def apply_fork(old: BlockChain) -> BlockChain:
+    """
+    Transforms the state from the previous hard fork (`old`) into the block
+    chain object for this hard fork and returns it.
+
+    When forks need to implement an irregular state transition, this function
+    is used to handle the irregularity. See the :ref:`DAO Fork <dao-fork>` for
+    an example.
+
+    Parameters
+    ----------
+    old :
+        Previous block chain object.
+
+    Returns
+    -------
+    new : `BlockChain`
+        Upgraded block chain object for this hard fork.
+
+    """
+    return old
+
+
+def get_last_256_block_hashes(chain: BlockChain) -> List[Hash32]:
+    """
+    Obtain the list of hashes of the previous 256 blocks in order of
+    increasing block number.
+
+    This function will return less hashes for the first 256 blocks.
+
+    The ``BLOCKHASH`` opcode needs to access the latest hashes on the chain,
+    therefore this function retrieves them.
+
+    Parameters
+    ----------
+    chain :
+        History and current state.
+
+    Returns
+    -------
+    recent_block_hashes : `List[Hash32]`
+        Hashes of the recent 256 blocks in order of increasing block number.
+
+    """
+    recent_blocks = chain.blocks[-255:]
+    # TODO: This function has not been tested rigorously
+    if len(recent_blocks) == 0:
+        return []
+
+    recent_block_hashes = []
+
+    for block in recent_blocks:
+        prev_block_hash = block.header.parent_hash
+        recent_block_hashes.append(prev_block_hash)
+
+    # We are computing the hash only for the most recent block and not for
+    # the rest of the blocks as they have successors which have the hash of
+    # the current block as parent hash.
+    most_recent_block_hash = keccak256(rlp.encode(recent_blocks[-1].header))
+    recent_block_hashes.append(most_recent_block_hash)
+
+    return recent_block_hashes
+
+
+def state_transition(
+    chain: BlockChain,
+    block: Block,
+    inclusion_list_transactions: Tuple[LegacyTransaction | Bytes, ...] = (),
+    sealed_transaction_contexts: Tuple[SealedTransactionContext, ...] = (),
+) -> None:
+    """
+    Attempts to apply a block to an existing block chain.
+
+    All parts of the block's contents need to be verified before being added
+    to the chain. Blocks are verified by ensuring that the contents of the
+    block make logical sense with the contents of the parent block. The
+    information in the block's header must also match the corresponding
+    information in the block.
+
+    To implement Ethereum, in theory clients are only required to store the
+    most recent 255 blocks of the chain since as far as execution is
+    concerned, only those blocks are accessed. Practically, however, clients
+    should store more blocks to handle reorgs.
+
+    Parameters
+    ----------
+    chain :
+        History and current state.
+    block :
+        Block to apply to `chain`.
+    inclusion_list_transactions :
+        Inclusion list transactions against which the block will be checked.
+    sealed_transaction_contexts :
+        Sealed ticket execution contexts from [EIP-8184].
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    chain_context = ChainContext(
+        chain_id=chain.chain_id,
+        block_hashes=get_last_256_block_hashes(chain),
+        parent_header=chain.blocks[-1].header,
+    )
+
+    block_diff = execute_block(
+        block,
+        chain.state,
+        chain_context,
+        inclusion_list_transactions,
+        sealed_transaction_contexts,
+    )
+
+    apply_changes_to_state(chain.state, block_diff)
+    chain.blocks.append(block)
+    if len(chain.blocks) > 255:
+        # Real clients have to store more blocks to deal with reorgs, but the
+        # protocol only requires the last 255
+        chain.blocks = chain.blocks[-255:]
+
+
+def execute_block(
+    block: Block,
+    pre_state: State,
+    chain_context: ChainContext,
+    inclusion_list_transactions: Tuple[LegacyTransaction | Bytes, ...] = (),
+    sealed_transaction_contexts: Tuple[SealedTransactionContext, ...] = (),
+) -> BlockDiff:
+    """
+    Execute a block and validate the resulting roots against the header.
+
+    This method is idempotent.
+
+    Parameters
+    ----------
+    block :
+        Block to validate and execute.
+    pre_state :
+        Pre-execution state provider.
+    chain_context :
+        Chain context that the block may need during execution.
+    inclusion_list_transactions :
+        Inclusion list transactions against which the block will be checked.
+    sealed_transaction_contexts :
+        Sealed ticket execution contexts from [EIP-8184].
+
+    Returns
+    -------
+    block_diff : `BlockDiff`
+        Account, storage, and code changes produced by block execution.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    if len(rlp.encode(block)) > MAX_RLP_BLOCK_SIZE:
+        raise InvalidBlock("Block rlp size exceeds MAX_RLP_BLOCK_SIZE")
+
+    parent_header = chain_context.parent_header
+    validate_header(parent_header, block.header)
+
+    if block.ommers != ():
+        raise InvalidBlock
+
+    block_state = BlockState(pre_state=pre_state)
+
+    block_env = vm.BlockEnvironment(
+        chain_id=chain_context.chain_id,
+        state=block_state,
+        block_gas_limit=block.header.gas_limit,
+        block_hashes=chain_context.block_hashes,
+        coinbase=block.header.coinbase,
+        number=block.header.number,
+        base_fee_per_gas=block.header.base_fee_per_gas,
+        time=block.header.timestamp,
+        prev_randao=block.header.prev_randao,
+        excess_blob_gas=block.header.excess_blob_gas,
+        parent_beacon_block_root=block.header.parent_beacon_block_root,
+        block_access_list_builder=BlockAccessListBuilder(),
+    )
+
+    block_output = apply_body(
+        block_env=block_env,
+        transactions=block.transactions,
+        withdrawals=block.withdrawals,
+        inclusion_list_transactions=inclusion_list_transactions,
+        sealed_transaction_contexts=sealed_transaction_contexts,
+    )
+    block_diff = extract_block_diff(block_state)
+    block_state_root, _ = pre_state.compute_state_root_and_trie_changes(
+        block_diff.account_changes, block_diff.storage_changes
+    )
+    transactions_root = root(block_output.transactions_trie)
+    receipt_root = root(block_output.receipts_trie)
+    block_logs_bloom = logs_bloom(block_output.block_logs)
+    withdrawals_root = root(block_output.withdrawals_trie)
+    requests_hash = compute_requests_hash(block_output.requests)
+    computed_block_access_list_hash = hash_block_access_list(
+        block_output.block_access_list
+    )
+
+    if block_output.block_gas_used != block.header.gas_used:
+        raise InvalidBlock(
+            f"{block_output.block_gas_used} != {block.header.gas_used}"
+        )
+    if transactions_root != block.header.transactions_root:
+        raise InvalidBlock
+    if block_state_root != block.header.state_root:
+        raise InvalidBlock
+    if receipt_root != block.header.receipt_root:
+        raise InvalidBlock
+    if block_logs_bloom != block.header.bloom:
+        raise InvalidBlock
+    if withdrawals_root != block.header.withdrawals_root:
+        raise InvalidBlock
+    if block_output.blob_gas_used != block.header.blob_gas_used:
+        raise InvalidBlock
+    if requests_hash != block.header.requests_hash:
+        raise InvalidBlock
+    if computed_block_access_list_hash != block.header.block_access_list_hash:
+        raise InvalidBlock("Invalid block access list hash")
+
+    return block_diff
+
+
+def calculate_base_fee_per_gas(
+    block_gas_limit: Uint,
+    parent_gas_limit: Uint,
+    parent_gas_used: Uint,
+    parent_base_fee_per_gas: Uint,
+) -> Uint:
+    """
+    Calculates the base fee per gas for the block.
+
+    Parameters
+    ----------
+    block_gas_limit :
+        Gas limit of the block for which the base fee is being calculated.
+    parent_gas_limit :
+        Gas limit of the parent block.
+    parent_gas_used :
+        Gas used in the parent block.
+    parent_base_fee_per_gas :
+        Base fee per gas of the parent block.
+
+    Returns
+    -------
+    base_fee_per_gas : `Uint`
+        Base fee per gas for the block.
+
+    """
+    parent_gas_target = parent_gas_limit // ELASTICITY_MULTIPLIER
+    if not check_gas_limit(block_gas_limit, parent_gas_limit):
+        raise InvalidBlock
+
+    if parent_gas_used == parent_gas_target:
+        expected_base_fee_per_gas = parent_base_fee_per_gas
+    elif parent_gas_used > parent_gas_target:
+        gas_used_delta = parent_gas_used - parent_gas_target
+
+        parent_fee_gas_delta = parent_base_fee_per_gas * gas_used_delta
+        target_fee_gas_delta = parent_fee_gas_delta // parent_gas_target
+
+        base_fee_per_gas_delta = max(
+            target_fee_gas_delta // BASE_FEE_MAX_CHANGE_DENOMINATOR,
+            Uint(1),
+        )
+
+        expected_base_fee_per_gas = (
+            parent_base_fee_per_gas + base_fee_per_gas_delta
+        )
+    else:
+        gas_used_delta = parent_gas_target - parent_gas_used
+
+        parent_fee_gas_delta = parent_base_fee_per_gas * gas_used_delta
+        target_fee_gas_delta = parent_fee_gas_delta // parent_gas_target
+
+        base_fee_per_gas_delta = (
+            target_fee_gas_delta // BASE_FEE_MAX_CHANGE_DENOMINATOR
+        )
+
+        expected_base_fee_per_gas = (
+            parent_base_fee_per_gas - base_fee_per_gas_delta
+        )
+
+    return Uint(expected_base_fee_per_gas)
+
+
+def validate_header(
+    parent_header: Header | PreviousHeader, header: Header
+) -> None:
+    """
+    Verify a block header against its parent.
+
+    In order to consider a block's header valid, the logic for the
+    quantities in the header should match the logic for the block itself.
+    For example the header timestamp should be greater than the block's parent
+    timestamp because the block was created *after* the parent block.
+    Additionally, the block's number should be directly following the parent
+    block's number since it is the next block in the sequence.
+
+    Parameters
+    ----------
+    parent_header :
+        Header of the parent block.
+    header :
+        Header to check for correctness.
+
+    """
+    if header.number < Uint(1):
+        raise InvalidBlock
+
+    excess_blob_gas = calculate_excess_blob_gas(parent_header)
+    if header.excess_blob_gas != excess_blob_gas:
+        raise InvalidBlock
+
+    if header.gas_used > header.gas_limit:
+        raise InvalidBlock
+
+    expected_base_fee_per_gas = calculate_base_fee_per_gas(
+        header.gas_limit,
+        parent_header.gas_limit,
+        parent_header.gas_used,
+        parent_header.base_fee_per_gas,
+    )
+    if expected_base_fee_per_gas != header.base_fee_per_gas:
+        raise InvalidBlock
+    if header.timestamp <= parent_header.timestamp:
+        raise InvalidBlock
+    if header.number != parent_header.number + Uint(1):
+        raise InvalidBlock
+    if len(header.extra_data) > 32:
+        raise InvalidBlock
+    if header.difficulty != 0:
+        raise InvalidBlock
+    if header.nonce != b"\x00\x00\x00\x00\x00\x00\x00\x00":
+        raise InvalidBlock
+    if header.ommers_hash != EMPTY_OMMER_HASH:
+        raise InvalidBlock
+
+    block_parent_hash = keccak256(rlp.encode(parent_header))
+    if header.parent_hash != block_parent_hash:
+        raise InvalidBlock
+
+
+def check_transaction(
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+    tx: RegularTransaction,
+    tx_state: TransactionState,
+) -> Tuple[Address, Uint, Tuple[VersionedHash, ...], U64]:
+    """
+    Check if the transaction is includable in the block.
+
+    Parameters
+    ----------
+    block_env :
+        The block scoped environment.
+    block_output :
+        The block output for the current block.
+    tx :
+        The transaction.
+    tx_state :
+        The transaction state tracker.
+
+    Returns
+    -------
+    sender_address :
+        The sender of the transaction.
+    effective_gas_price :
+        The price to charge for gas when the transaction is executed.
+    blob_versioned_hashes :
+        The blob versioned hashes of the transaction.
+    tx_blob_gas_used:
+        The blob gas used by the transaction.
+
+    Raises
+    ------
+    InvalidBlock :
+        If the transaction is not includable.
+    GasUsedExceedsLimitError :
+        If the gas used by the transaction exceeds the block's gas limit.
+    NonceMismatchError :
+        If the nonce of the transaction is not equal to the sender's nonce.
+    InsufficientBalanceError :
+        If the sender's balance is not enough to pay for the transaction.
+    InvalidSenderError :
+        If the transaction is from an address that does not exist anymore.
+    PriorityFeeGreaterThanMaxFeeError :
+        If the priority fee is greater than the maximum fee per gas.
+    InsufficientMaxFeePerGasError :
+        If the maximum fee per gas is insufficient for the transaction.
+    InsufficientMaxFeePerBlobGasError :
+        If the maximum fee per blob gas is insufficient for the transaction.
+    BlobGasLimitExceededError :
+        If the blob gas used by the transaction exceeds the block's blob gas
+        limit.
+    InvalidBlobVersionedHashError :
+        If the transaction contains a blob versioned hash with an invalid
+        version.
+    NoBlobDataError :
+        If the transaction is a type 3 but has no blobs.
+    BlobCountExceededError :
+        If the transaction is a type 3 and has more blobs than the limit.
+    TransactionTypeContractCreationError:
+        If the transaction type is not allowed to create contracts.
+    EmptyAuthorizationListError :
+        If the transaction is a SetCodeTransaction and the authorization list
+        is empty.
+
+    """
+    gas_available = block_env.block_gas_limit - block_output.block_gas_used
+    blob_gas_available = MAX_BLOB_GAS_PER_BLOCK - block_output.blob_gas_used
+
+    if tx.gas > gas_available:
+        raise GasUsedExceedsLimitError("gas used exceeds limit")
+
+    tx_blob_gas_used = calculate_total_blob_gas(tx)
+    if tx_blob_gas_used > blob_gas_available:
+        raise BlobGasLimitExceededError("blob gas limit exceeded")
+
+    sender_address = recover_sender(block_env.chain_id, tx)
+    sender_account = get_account(tx_state, sender_address)
+
+    if isinstance(
+        tx, (FeeMarketTransaction, BlobTransaction, SetCodeTransaction)
+    ):
+        if tx.max_fee_per_gas < tx.max_priority_fee_per_gas:
+            raise PriorityFeeGreaterThanMaxFeeError(
+                "priority fee greater than max fee"
+            )
+        if tx.max_fee_per_gas < block_env.base_fee_per_gas:
+            raise InsufficientMaxFeePerGasError(
+                tx.max_fee_per_gas, block_env.base_fee_per_gas
+            )
+
+        priority_fee_per_gas = min(
+            tx.max_priority_fee_per_gas,
+            tx.max_fee_per_gas - block_env.base_fee_per_gas,
+        )
+        effective_gas_price = priority_fee_per_gas + block_env.base_fee_per_gas
+        max_gas_fee = tx.gas * tx.max_fee_per_gas
+    else:
+        if tx.gas_price < block_env.base_fee_per_gas:
+            raise InvalidBlock
+        effective_gas_price = tx.gas_price
+        max_gas_fee = tx.gas * tx.gas_price
+
+    if isinstance(tx, BlobTransaction):
+        blob_count = len(tx.blob_versioned_hashes)
+        if blob_count == 0:
+            raise NoBlobDataError("no blob data in transaction")
+        if blob_count > BLOB_COUNT_LIMIT:
+            raise BlobCountExceededError(
+                f"Tx has {blob_count} blobs. Max allowed: {BLOB_COUNT_LIMIT}"
+            )
+        for blob_versioned_hash in tx.blob_versioned_hashes:
+            if blob_versioned_hash[0:1] != VERSIONED_HASH_VERSION_KZG:
+                raise InvalidBlobVersionedHashError(
+                    "invalid blob versioned hash"
+                )
+
+        blob_gas_price = calculate_blob_gas_price(block_env.excess_blob_gas)
+        if Uint(tx.max_fee_per_blob_gas) < blob_gas_price:
+            raise InsufficientMaxFeePerBlobGasError(
+                "insufficient max fee per blob gas"
+            )
+
+        max_gas_fee += Uint(calculate_total_blob_gas(tx)) * Uint(
+            tx.max_fee_per_blob_gas
+        )
+        blob_versioned_hashes = tx.blob_versioned_hashes
+    else:
+        blob_versioned_hashes = ()
+
+    if isinstance(tx, (BlobTransaction, SetCodeTransaction)):
+        if not isinstance(tx.to, Address):
+            raise TransactionTypeContractCreationError(tx)
+
+    if isinstance(tx, SetCodeTransaction):
+        if not any(tx.authorizations):
+            raise EmptyAuthorizationListError("empty authorization list")
+
+    if sender_account.nonce > Uint(tx.nonce):
+        raise NonceMismatchError("nonce too low")
+    elif sender_account.nonce < Uint(tx.nonce):
+        raise NonceMismatchError("nonce too high")
+
+    if Uint(sender_account.balance) < max_gas_fee + Uint(tx.value):
+        raise InsufficientBalanceError("insufficient sender balance")
+    sender_code = get_code(tx_state, sender_account.code_hash)
+    if sender_account.code_hash != EMPTY_CODE_HASH and not is_valid_delegation(
+        sender_code
+    ):
+        raise InvalidSenderError("not EOA")
+
+    return (
+        sender_address,
+        effective_gas_price,
+        blob_versioned_hashes,
+        tx_blob_gas_used,
+    )
+
+
+def make_receipt(
+    tx: RegularTransaction,
+    error: Optional[EthereumException],
+    cumulative_gas_used: Uint,
+    logs: Tuple[Log, ...],
+) -> Bytes | Receipt:
+    """
+    Make the receipt for a transaction that was executed.
+
+    Parameters
+    ----------
+    tx :
+        The executed transaction.
+    error :
+        Error in the top level frame of the transaction, if any.
+    cumulative_gas_used :
+        The total gas used so far in the block after the transaction was
+        executed.
+    logs :
+        The logs produced by the transaction.
+
+    Returns
+    -------
+    receipt :
+        The receipt for the transaction.
+
+    """
+    receipt = Receipt(
+        succeeded=error is None,
+        cumulative_gas_used=cumulative_gas_used,
+        bloom=logs_bloom(logs),
+        logs=logs,
+    )
+
+    return encode_receipt(tx, receipt)
+
+
+def process_checked_system_transaction(
+    block_env: vm.BlockEnvironment,
+    target_address: Address,
+    data: Bytes,
+) -> MessageCallOutput:
+    """
+    Process a system transaction and raise an error if the contract does not
+    contain code or if the transaction fails.
+
+    Parameters
+    ----------
+    block_env :
+        The block scoped environment.
+    target_address :
+        Address of the contract to call.
+    data :
+        Data to pass to the contract.
+
+    Returns
+    -------
+    system_tx_output : `MessageCallOutput`
+        Output of processing the system transaction.
+
+    """
+    # Read through BlockState (not pre-state) so that a system contract
+    # deployed by an earlier transaction in the same block is visible.
+    # See EIP-7002 and EIP-7251 for this edge case.
+    #
+    # This read is not recorded in the state tracker.
+    # However, this is fine because `process_unchecked_system_transaction`
+    # does its own get_account on the TransactionState that we do incorporate
+    # into BlockState.
+    untracked_state = TransactionState(parent=block_env.state)
+    system_contract_code = get_code(
+        untracked_state,
+        get_account(untracked_state, target_address).code_hash,
+    )
+
+    if len(system_contract_code) == 0:
+        raise InvalidBlock(
+            f"System contract address {target_address.hex()} does not "
+            "contain code"
+        )
+
+    system_tx_output = process_unchecked_system_transaction(
+        block_env,
+        target_address,
+        data,
+    )
+
+    if system_tx_output.error:
+        raise InvalidBlock(
+            f"System contract ({target_address.hex()}) call failed: "
+            f"{system_tx_output.error}"
+        )
+
+    return system_tx_output
+
+
+def process_unchecked_system_transaction(
+    block_env: vm.BlockEnvironment,
+    target_address: Address,
+    data: Bytes,
+) -> MessageCallOutput:
+    """
+    Process a system transaction without checking if the contract contains
+    code or if the transaction fails.
+
+    Parameters
+    ----------
+    block_env :
+        The block scoped environment.
+    target_address :
+        Address of the contract to call.
+    data :
+        Data to pass to the contract.
+
+    Returns
+    -------
+    system_tx_output : `MessageCallOutput`
+        Output of processing the system transaction.
+
+    """
+    system_tx_state = TransactionState(parent=block_env.state)
+    system_contract_code = get_code(
+        system_tx_state,
+        get_account(system_tx_state, target_address).code_hash,
+    )
+
+    tx_env = vm.TransactionEnvironment(
+        origin=SYSTEM_ADDRESS,
+        gas_price=block_env.base_fee_per_gas,
+        gas=SYSTEM_TRANSACTION_GAS,
+        access_list_addresses=set(),
+        access_list_storage_keys=set(),
+        state=system_tx_state,
+        blob_versioned_hashes=(),
+        authorizations=(),
+        index_in_block=None,
+        tx_hash=None,
+    )
+
+    system_tx_message = Message(
+        block_env=block_env,
+        tx_env=tx_env,
+        caller=SYSTEM_ADDRESS,
+        target=target_address,
+        gas=SYSTEM_TRANSACTION_GAS,
+        value=U256(0),
+        data=data,
+        code=system_contract_code,
+        depth=Uint(0),
+        current_target=target_address,
+        code_address=target_address,
+        should_transfer_value=False,
+        is_static=False,
+        accessed_addresses=set(),
+        accessed_storage_keys=set(),
+        disable_precompiles=False,
+        parent_evm=None,
+    )
+
+    system_tx_output = process_message_call(system_tx_message)
+
+    incorporate_tx_into_block(
+        system_tx_state, block_env.block_access_list_builder
+    )
+
+    return system_tx_output
+
+
+def apply_body(
+    block_env: vm.BlockEnvironment,
+    transactions: Tuple[LegacyTransaction | Bytes, ...],
+    withdrawals: Tuple[Withdrawal, ...],
+    inclusion_list_transactions: Tuple[LegacyTransaction | Bytes, ...],
+    sealed_transaction_contexts: Tuple[SealedTransactionContext, ...] = (),
+) -> vm.BlockOutput:
+    """
+    Executes a block.
+
+    Many of the contents of a block are stored in data structures called
+    tries. There is a transactions trie which is similar to a ledger of the
+    transactions stored in the current block. There is also a receipts trie
+    which stores the results of executing a transaction, like the post state
+    and gas used. This function creates and executes the block that is to be
+    added to the chain.
+
+    Parameters
+    ----------
+    block_env :
+        The block scoped environment.
+    transactions :
+        Transactions included in the block.
+    withdrawals :
+        Withdrawals to be processed in the current block.
+    inclusion_list_transactions :
+        Inclusion list transactions against which the block will be checked.
+    sealed_transaction_contexts :
+        Sealed ticket execution contexts supplied by the consensus layer.
+        These are validated and executed before regular transactions,
+        implementing the LUCID top-of-block ordering from [EIP-8184].
+
+    Returns
+    -------
+    block_output :
+        The block output for the current block.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    block_output = vm.BlockOutput()
+
+    process_unchecked_system_transaction(
+        block_env=block_env,
+        target_address=BEACON_ROOTS_ADDRESS,
+        data=block_env.parent_beacon_block_root,
+    )
+
+    process_unchecked_system_transaction(
+        block_env=block_env,
+        target_address=HISTORY_STORAGE_ADDRESS,
+        data=block_env.block_hashes[-1],  # The parent hash
+    )
+
+    # Execute sealed tickets at the top of the block (EIP-8184).
+    process_sealed_tickets(
+        sealed_transaction_contexts, block_env, block_output
+    )
+
+    for i, tx in enumerate(map(decode_transaction, transactions)):
+        assert not isinstance(tx, SealedTicketTransaction)
+        process_transaction(block_env, block_output, tx, Uint(i))
+
+    # Check if the block satisfies the inclusion list constraints (EIP-7805)
+    block_output.is_inclusion_list_satisfied = (
+        check_inclusion_list_transactions(
+            block_env=block_env,
+            block_output=block_output,
+            transactions=transactions,
+            inclusion_list_transactions=inclusion_list_transactions,
+        )
+    )
+
+    # EIP-7928: Post-execution operations use index N+1
+    block_env.block_access_list_builder.block_access_index = BlockAccessIndex(
+        ulen(transactions) + Uint(1)
+    )
+
+    process_withdrawals(block_env, block_output, withdrawals)
+
+    process_general_purpose_requests(
+        block_env=block_env,
+        block_output=block_output,
+    )
+
+    block_output.block_access_list = build_block_access_list(
+        block_env.block_access_list_builder, block_env.state
+    )
+
+    # Validate block access list gas limit constraint (EIP-7928)
+    validate_block_access_list_gas_limit(
+        block_access_list=block_output.block_access_list,
+        block_gas_limit=block_env.block_gas_limit,
+    )
+
+    return block_output
+
+
+def process_general_purpose_requests(
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+) -> None:
+    """
+    Process all the requests in the block.
+
+    Parameters
+    ----------
+    block_env :
+        The execution environment for the Block.
+    block_output :
+        The block output for the current block.
+
+    """
+    # Requests are to be in ascending order of request type
+    deposit_requests = parse_deposit_requests(block_output)
+    requests_from_execution = block_output.requests
+    if len(deposit_requests) > 0:
+        requests_from_execution.append(DEPOSIT_REQUEST_TYPE + deposit_requests)
+
+    system_withdrawal_tx_output = process_checked_system_transaction(
+        block_env=block_env,
+        target_address=WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
+        data=b"",
+    )
+
+    if len(system_withdrawal_tx_output.return_data) > 0:
+        requests_from_execution.append(
+            WITHDRAWAL_REQUEST_TYPE + system_withdrawal_tx_output.return_data
+        )
+
+    system_consolidation_tx_output = process_checked_system_transaction(
+        block_env=block_env,
+        target_address=CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS,
+        data=b"",
+    )
+
+    if len(system_consolidation_tx_output.return_data) > 0:
+        requests_from_execution.append(
+            CONSOLIDATION_REQUEST_TYPE
+            + system_consolidation_tx_output.return_data
+        )
+
+
+def process_transaction(
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+    tx: RegularTransaction,
+    index: Uint,
+) -> None:
+    """
+    Execute a transaction against the provided environment.
+
+    This function processes the actions needed to execute a transaction.
+    It decrements the sender's account balance after calculating the gas fee
+    and refunds them the proper amount after execution. Calling contracts,
+    deploying code, and incrementing nonces are all examples of actions that
+    happen within this function or from a call made within this function.
+
+    Accounts that are marked for deletion are processed and destroyed after
+    execution.
+
+    Parameters
+    ----------
+    block_env :
+        Environment for the Ethereum Virtual Machine.
+    block_output :
+        The block output for the current block.
+    tx :
+        Transaction to execute.
+    index:
+        Index of the transaction in the block.
+
+    """
+    assert not isinstance(tx, SealedTicketTransaction)
+    block_env.block_access_list_builder.block_access_index = BlockAccessIndex(
+        index + Uint(1)
+    )
+    tx_state = TransactionState(parent=block_env.state)
+
+    trie_set(
+        block_output.transactions_trie,
+        rlp.encode(index),
+        encode_transaction(tx),
+    )
+
+    intrinsic_gas, calldata_floor_gas_cost = validate_transaction(tx)
+
+    (
+        sender,
+        effective_gas_price,
+        blob_versioned_hashes,
+        tx_blob_gas_used,
+    ) = check_transaction(
+        block_env=block_env,
+        block_output=block_output,
+        tx=tx,
+        tx_state=tx_state,
+    )
+
+    sender_account = get_account(tx_state, sender)
+
+    if isinstance(tx, BlobTransaction):
+        blob_gas_fee = calculate_data_fee(block_env.excess_blob_gas, tx)
+    else:
+        blob_gas_fee = Uint(0)
+
+    effective_gas_fee = tx.gas * effective_gas_price
+
+    gas = tx.gas - intrinsic_gas
+
+    increment_nonce(tx_state, sender)
+
+    sender_balance_after_gas_fee = (
+        Uint(sender_account.balance) - effective_gas_fee - blob_gas_fee
+    )
+    set_account_balance(tx_state, sender, U256(sender_balance_after_gas_fee))
+
+    access_list_addresses = set()
+    access_list_storage_keys = set()
+    access_list_addresses.add(block_env.coinbase)
+    if has_access_list(tx):
+        for access in tx.access_list:
+            access_list_addresses.add(access.account)
+            for slot in access.slots:
+                access_list_storage_keys.add((access.account, slot))
+
+    authorizations: Tuple[Authorization, ...] = ()
+    if isinstance(tx, SetCodeTransaction):
+        authorizations = tx.authorizations
+
+    tx_env = vm.TransactionEnvironment(
+        origin=sender,
+        gas_price=effective_gas_price,
+        gas=gas,
+        access_list_addresses=access_list_addresses,
+        access_list_storage_keys=access_list_storage_keys,
+        state=tx_state,
+        blob_versioned_hashes=blob_versioned_hashes,
+        authorizations=authorizations,
+        index_in_block=index,
+        tx_hash=get_transaction_hash(encode_transaction(tx)),
+    )
+
+    message = prepare_message(
+        block_env,
+        tx_env,
+        tx,
+    )
+
+    tx_output = process_message_call(message)
+
+    # For EIP-7623 we first calculate the execution_gas_used, which includes
+    # the execution gas refund.
+    tx_gas_used_before_refund = tx.gas - tx_output.gas_left
+    tx_gas_refund = min(
+        tx_gas_used_before_refund // Uint(5), Uint(tx_output.refund_counter)
+    )
+    tx_gas_used_after_refund = tx_gas_used_before_refund - tx_gas_refund
+
+    # Transactions with less execution_gas_used than the floor pay at the
+    # floor cost.
+    tx_gas_used_after_refund = max(
+        tx_gas_used_after_refund, calldata_floor_gas_cost
+    )
+
+    tx_gas_left = tx.gas - tx_gas_used_after_refund
+    gas_refund_amount = tx_gas_left * effective_gas_price
+
+    # For non-1559 transactions effective_gas_price == tx.gas_price
+    priority_fee_per_gas = effective_gas_price - block_env.base_fee_per_gas
+    transaction_fee = tx_gas_used_after_refund * priority_fee_per_gas
+
+    # refund gas
+    sender_balance_after_refund = get_account(tx_state, sender).balance + U256(
+        gas_refund_amount
+    )
+    set_account_balance(tx_state, sender, sender_balance_after_refund)
+
+    coinbase_balance_after_mining_fee = get_account(
+        tx_state, block_env.coinbase
+    ).balance + U256(transaction_fee)
+
+    set_account_balance(
+        tx_state, block_env.coinbase, coinbase_balance_after_mining_fee
+    )
+
+    if coinbase_balance_after_mining_fee == 0 and account_exists_and_is_empty(
+        tx_state, block_env.coinbase
+    ):
+        destroy_account(tx_state, block_env.coinbase)
+
+    block_output.block_gas_used += tx_gas_used_after_refund
+    block_output.blob_gas_used += tx_blob_gas_used
+
+    receipt = make_receipt(
+        tx, tx_output.error, block_output.block_gas_used, tx_output.logs
+    )
+
+    receipt_key = rlp.encode(Uint(index))
+    block_output.receipt_keys += (receipt_key,)
+
+    trie_set(
+        block_output.receipts_trie,
+        receipt_key,
+        receipt,
+    )
+
+    block_output.block_logs += tx_output.logs
+
+    for address in tx_output.accounts_to_delete:
+        destroy_account(tx_state, address)
+
+    incorporate_tx_into_block(tx_state, block_env.block_access_list_builder)
+
+
+def process_withdrawals(
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+    withdrawals: Tuple[Withdrawal, ...],
+) -> None:
+    """
+    Increase the balance of the withdrawing account.
+    """
+    wd_state = TransactionState(parent=block_env.state)
+
+    for i, wd in enumerate(withdrawals):
+        trie_set(
+            block_output.withdrawals_trie,
+            rlp.encode(Uint(i)),
+            rlp.encode(wd),
+        )
+
+        current_balance = get_account(wd_state, wd.address).balance
+        new_balance = current_balance + wd.amount * GWEI_TO_WEI
+        set_account_balance(wd_state, wd.address, new_balance)
+
+    incorporate_tx_into_block(wd_state, block_env.block_access_list_builder)
+
+
+def check_gas_limit(gas_limit: Uint, parent_gas_limit: Uint) -> bool:
+    """
+    Validates the gas limit for a block.
+
+    The bounds of the gas limit, ``max_adjustment_delta``, is set as the
+    quotient of the parent block's gas limit and the
+    ``LIMIT_ADJUSTMENT_FACTOR``. Therefore, if the gas limit that is passed
+    through as a parameter is greater than or equal to the *sum* of the
+    parent's gas and the adjustment delta then the limit for gas is too high
+    and fails this function's check. Similarly, if the limit is less than or
+    equal to the *difference* of the parent's gas and the adjustment delta *or*
+    the predefined ``LIMIT_MINIMUM`` then this function's check fails because
+    the gas limit doesn't allow for a sufficient or reasonable amount of gas to
+    be used on a block.
+
+    Parameters
+    ----------
+    gas_limit :
+        Gas limit to validate.
+
+    parent_gas_limit :
+        Gas limit of the parent block.
+
+    Returns
+    -------
+    check : `bool`
+        True if gas limit constraints are satisfied, False otherwise.
+
+    """
+    max_adjustment_delta = parent_gas_limit // GasCosts.LIMIT_ADJUSTMENT_FACTOR
+    if gas_limit >= parent_gas_limit + max_adjustment_delta:
+        return False
+    if gas_limit <= parent_gas_limit - max_adjustment_delta:
+        return False
+    if gas_limit < GasCosts.LIMIT_MINIMUM:
+        return False
+
+    return True
+
+
+def check_inclusion_list_transactions(
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+    transactions: Tuple[LegacyTransaction | Bytes, ...],
+    inclusion_list_transactions: Tuple[LegacyTransaction | Bytes, ...],
+) -> bool:
+    """
+    Check whether the block satisfies the inclusion list constraints.
+
+    For each inclusion list transaction not present in the block,
+    check whether it could have been validly appended to the end of the block.
+    Blob transactions are excluded from this check. If any such transaction
+    could have been appended, the block fails the inclusion list check.
+
+    The inclusion list compliance does not affect any other block outputs.
+
+    Parameters
+    ----------
+    block_env :
+        The block scoped environment.
+    block_output :
+        The block output for the current block.
+    transactions :
+        Transactions included in the block.
+    inclusion_list_transactions :
+        Inclusion list transactions against which the block will be checked.
+
+    Returns
+    -------
+    is_inclusion_list_satisfied : `bool`
+        True if the block passes the inclusion list check, False otherwise.
+
+    """
+    tx_hashes = {get_transaction_hash(raw_tx) for raw_tx in transactions}
+    tx_state = TransactionState(parent=block_env.state)
+
+    for raw_tx in inclusion_list_transactions:
+        if get_transaction_hash(raw_tx) in tx_hashes:
+            continue
+
+        tx = decode_transaction(raw_tx)
+
+        # Ignore blob transactions and sealed ticket transactions.
+        if isinstance(tx, (BlobTransaction, SealedTicketTransaction)):
+            continue
+
+        try:
+            validate_transaction(tx)
+            check_transaction(block_env, block_output, tx, tx_state)
+        except EthereumException:
+            continue
+        else:
+            # This inclusion list transaction could have been included.
+            return False
+
+    return True
+
+
+def validate_sealed_transaction_context(
+    ctx: SealedTransactionContext,
+    chain_id: U64,
+    base_fee_per_gas: Uint,
+) -> None:
+    """
+    Validate the commitment bindings and plaintext constraints of a sealed
+    ticket execution context.
+
+    Checks that the ciphertext hash, key commitment, and reveal commitment
+    are all consistent with the decrypted plaintext transaction, and that
+    the plaintext satisfies the LUCID zero-fee and gas constraints.
+
+    Introduced in [EIP-8184].
+
+    Parameters
+    ----------
+    ctx :
+        The sealed transaction context to validate.
+    chain_id :
+        Chain identifier used in the SSZ reveal commitment preimage.
+    base_fee_per_gas :
+        Current block base fee per gas.
+
+    Raises
+    ------
+    SealedTicketDecryptionError :
+        If any commitment verification or constraint check fails.
+    SealedTicketFeeError :
+        If the ticket's ``max_fee_per_gas`` is below the block base fee.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    ticket = ctx.ticket
+
+    # Verify ciphertext hash binding.
+    if keccak256(ctx.ciphertext_envelope) != ticket.ciphertext_hash:
+        raise SealedTicketDecryptionError("ciphertext_hash mismatch")
+
+    # Verify key commitment binding.
+    if keccak256(ctx.k_dem) != ticket.key_commitment:
+        raise SealedTicketDecryptionError("key_commitment mismatch")
+
+    # Verify the ticket covers the base fee.
+    if ticket.max_fee_per_gas < base_fee_per_gas:
+        raise SealedTicketFeeError("max_fee_per_gas below base_fee_per_gas")
+
+    # Decrypt the ciphertext.  The envelope layout is:
+    #   nonce (12 bytes) || ciphertext_with_tag
+    # Associated data is the reveal commitment, binding decryption to the
+    # committed preimage.
+    if len(ctx.ciphertext_envelope) < 12:
+        raise SealedTicketDecryptionError("ciphertext_envelope too short")
+    nonce_bytes = bytes(ctx.ciphertext_envelope[:12])
+    ciphertext_with_tag = Bytes(ctx.ciphertext_envelope[12:])
+
+    try:
+        plaintext_bytes = chacha20poly1305_decrypt(
+            ctx.k_dem,
+            nonce_bytes,
+            ciphertext_with_tag,
+            associated_data=Bytes(ticket.reveal_commitment),
+        )
+    except AEADDecryptionError as e:
+        raise SealedTicketDecryptionError("AEAD decryption failed") from e
+
+    # Verify the decrypted bytes match the supplied plaintext transaction.
+    expected_plaintext_bytes = encode_transaction(ctx.plaintext_tx)
+    if plaintext_bytes != expected_plaintext_bytes:
+        raise SealedTicketDecryptionError("decrypted plaintext_tx mismatch")
+
+    # Verify the SSZ reveal commitment.
+    expected_reveal_commitment = hash_tree_root_reveal_commitment_preimage(
+        chain_id=int(chain_id),
+        ticket_from=bytes(ctx.ticket_sender),
+        ticket_nonce=int(ticket.nonce),
+        plaintext_tx=bytes(expected_plaintext_bytes),
+        max_bytes_per_st=int(MAX_BYTES_PER_ST),
+    )
+    if expected_reveal_commitment != ticket.reveal_commitment:
+        raise SealedTicketDecryptionError("reveal_commitment mismatch")
+
+    # The plaintext transaction must carry zero fees (the ticket's fee fields
+    # govern all gas payment) and its gas must equal the ticket's gas limit.
+    if ctx.plaintext_tx.max_priority_fee_per_gas != 0:
+        raise SealedTicketDecryptionError(
+            "plaintext_tx max_priority_fee_per_gas must be zero"
+        )
+    if ctx.plaintext_tx.max_fee_per_gas != 0:
+        raise SealedTicketDecryptionError(
+            "plaintext_tx max_fee_per_gas must be zero"
+        )
+    if Uint(ctx.plaintext_tx.gas) != ticket.gas_limit:
+        raise SealedTicketDecryptionError(
+            "plaintext_tx gas must equal ticket.gas_limit"
+        )
+
+    # Verify the commitment ordering constraint.
+    if ctx.commitment_index > Uint(ticket.max_preceding_commitments):
+        raise SealedTicketDecryptionError(
+            "commitment_index exceeds max_preceding_commitments"
+        )
+
+
+def compute_effective_tob_fee(
+    ticket: SealedTicketTransaction,
+    base_fee_per_gas: Uint,
+) -> Uint:
+    """
+    Compute the effective top-of-block fee for a sealed ticket.
+
+    The effective TOB fee is the minimum of the ticket's ``max_tob_fee``
+    and the per-block headroom remaining after the base fee and priority
+    fee have been accounted for.
+
+    Introduced in [EIP-8184].
+
+    Parameters
+    ----------
+    ticket :
+        The sealed ticket transaction.
+    base_fee_per_gas :
+        Current block base fee per gas.
+
+    Returns
+    -------
+    effective_tob_fee : `Uint`
+        Effective top-of-block fee, in wei.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    if ticket.max_fee_per_gas < base_fee_per_gas:
+        return Uint(0)
+    available_per_gas = ticket.max_fee_per_gas - base_fee_per_gas
+    priority_fee_per_gas = min(
+        ticket.max_priority_fee_per_gas, available_per_gas
+    )
+    remaining_per_gas = available_per_gas - priority_fee_per_gas
+    max_from_headroom = remaining_per_gas * ticket.gas_limit
+    return min(ticket.max_tob_fee, max_from_headroom)
+
+
+def check_sealed_ticket_ordering(
+    contexts: Tuple[SealedTransactionContext, ...],
+    base_fee_per_gas: Uint,
+) -> bool:
+    """
+    Return True if sealed ticket contexts are in the required execution order.
+
+    Commitments must be ordered by:
+
+    1. Descending effective TOB fee.
+    2. Descending ``gas_limit`` (gas obligation).
+    3. Ascending ``reveal_commitment`` (lexicographic tie-break).
+
+    Introduced in [EIP-8184].
+
+    Parameters
+    ----------
+    contexts :
+        Sequence of sealed transaction contexts to check.
+    base_fee_per_gas :
+        Current block base fee per gas.
+
+    Returns
+    -------
+    is_valid : `bool`
+        True if the ordering constraints are satisfied.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    for i in range(len(contexts) - 1):
+        a = contexts[i]
+        b = contexts[i + 1]
+        tob_a = compute_effective_tob_fee(a.ticket, base_fee_per_gas)
+        tob_b = compute_effective_tob_fee(b.ticket, base_fee_per_gas)
+        # Primary key: descending TOB fee.
+        if tob_a > tob_b:
+            continue
+        if tob_a < tob_b:
+            return False
+        # Secondary key: descending gas_limit.
+        if a.ticket.gas_limit > b.ticket.gas_limit:
+            continue
+        if a.ticket.gas_limit < b.ticket.gas_limit:
+            return False
+        # Tertiary key: ascending reveal_commitment.
+        if a.ticket.reveal_commitment <= b.ticket.reveal_commitment:
+            continue
+        return False
+    return True
+
+
+def process_sealed_ticket(
+    ctx: SealedTransactionContext,
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+) -> None:
+    """
+    Execute a single decrypted sealed ticket transaction.
+
+    Performs fee accounting using the ticket's fee fields, executes the
+    decrypted ``plaintext_tx``, and credits fees to the block coinbase and
+    key publication fee recipient.
+
+    Introduced in [EIP-8184].
+
+    Parameters
+    ----------
+    ctx :
+        The validated sealed transaction context to execute.
+    block_env :
+        Block scoped execution environment.
+    block_output :
+        Accumulated block outputs updated in place.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    ticket = ctx.ticket
+    sender = ctx.ticket_sender
+    tx = ctx.plaintext_tx
+    tx_state = TransactionState(parent=block_env.state)
+
+    base_fee = block_env.base_fee_per_gas
+
+    # Compute effective per-gas priority fee and total TOB fee.
+    available_per_gas = ticket.max_fee_per_gas - base_fee
+    priority_fee_per_gas = min(
+        ticket.max_priority_fee_per_gas, available_per_gas
+    )
+    effective_gas_price = base_fee + priority_fee_per_gas
+    effective_tob_fee = compute_effective_tob_fee(ticket, base_fee)
+
+    # Upfront deduction: max gas reserve + TOB fee + key publication fee.
+    max_gas_fee = ticket.gas_limit * ticket.max_fee_per_gas
+    total_upfront = (
+        max_gas_fee + effective_tob_fee + ticket.key_publication_fee
+    )
+
+    # Validate sender balance before deducting.
+    sender_account = get_account(tx_state, sender)
+    if Uint(sender_account.balance) < total_upfront + Uint(tx.value):
+        raise SealedTicketFeeError(
+            "insufficient sender balance for sealed ticket"
+        )
+
+    # Increment sender nonce and deduct upfront fee.
+    increment_nonce(tx_state, sender)
+    set_account_balance(
+        tx_state,
+        sender,
+        U256(Uint(sender_account.balance) - total_upfront),
+    )
+
+    # Compute intrinsic gas from the plaintext transaction.
+    intrinsic_gas, calldata_floor_gas = validate_transaction(tx)
+    gas = ticket.gas_limit - intrinsic_gas
+
+    tx_env = vm.TransactionEnvironment(
+        origin=sender,
+        gas_price=effective_gas_price,
+        gas=gas,
+        access_list_addresses={block_env.coinbase},
+        access_list_storage_keys=set(),
+        state=tx_state,
+        blob_versioned_hashes=(),
+        authorizations=(),
+        index_in_block=None,
+        tx_hash=get_transaction_hash(encode_transaction(ticket)),
+        commitment_slot=ctx.commitment_slot,
+    )
+
+    message = prepare_message(block_env, tx_env, tx)
+    tx_output = process_message_call(message)
+
+    # Apply execution gas refund and EIP-7623 calldata floor.
+    tx_gas_used_before_refund = ticket.gas_limit - tx_output.gas_left
+    tx_gas_refund = min(
+        tx_gas_used_before_refund // Uint(5),
+        Uint(tx_output.refund_counter),
+    )
+    tx_gas_used = tx_gas_used_before_refund - tx_gas_refund
+    tx_gas_used = max(tx_gas_used, calldata_floor_gas)
+    tx_gas_left = ticket.gas_limit - tx_gas_used
+
+    # Refund unused gas to sender.
+    gas_refund_amount = tx_gas_left * effective_gas_price
+    set_account_balance(
+        tx_state,
+        sender,
+        get_account(tx_state, sender).balance + U256(gas_refund_amount),
+    )
+
+    # Credit coinbase: priority fee on gas used + full TOB fee.
+    priority_fee_total = tx_gas_used * priority_fee_per_gas
+    coinbase_credit = U256(priority_fee_total + effective_tob_fee)
+    coinbase_balance = get_account(tx_state, block_env.coinbase).balance
+    new_coinbase_balance = coinbase_balance + coinbase_credit
+    set_account_balance(tx_state, block_env.coinbase, new_coinbase_balance)
+
+    if new_coinbase_balance == 0 and account_exists_and_is_empty(
+        tx_state, block_env.coinbase
+    ):
+        destroy_account(tx_state, block_env.coinbase)
+
+    # Credit key publication fee recipient.
+    if ticket.key_publication_fee > Uint(0):
+        kpf_recipient = ticket.key_publication_fee_recipient
+        kpf_balance = get_account(tx_state, kpf_recipient).balance
+        set_account_balance(
+            tx_state,
+            kpf_recipient,
+            kpf_balance + U256(ticket.key_publication_fee),
+        )
+
+    block_output.block_gas_used += tx_gas_used
+    block_output.block_logs += tx_output.logs
+
+    for address in tx_output.accounts_to_delete:
+        destroy_account(tx_state, address)
+
+    incorporate_tx_into_block(tx_state, block_env.block_access_list_builder)
+
+
+def process_sealed_tickets(
+    sealed_contexts: Tuple[SealedTransactionContext, ...],
+    block_env: vm.BlockEnvironment,
+    block_output: vm.BlockOutput,
+) -> None:
+    """
+    Validate and execute all sealed ticket transactions for this block.
+
+    Called before regular transactions in :func:`apply_body`, implementing
+    the top-of-block execution order required by LUCID.
+
+    Ordering violations set ``block_output.is_sealed_ticket_ordering_valid``
+    to ``False`` but do not abort execution; commitment or fee validation
+    failures raise immediately as ``InvalidBlock``.
+
+    Introduced in [EIP-8184].
+
+    Parameters
+    ----------
+    sealed_contexts :
+        Ordered sequence of sealed ticket execution contexts.
+    block_env :
+        Block scoped execution environment.
+    block_output :
+        Accumulated block outputs updated in place.
+
+    [EIP-8184]: https://eips.ethereum.org/EIPS/eip-8184
+
+    """
+    if not sealed_contexts:
+        return
+
+    for ctx in sealed_contexts:
+        validate_sealed_transaction_context(
+            ctx, block_env.chain_id, block_env.base_fee_per_gas
+        )
+
+    block_output.is_sealed_ticket_ordering_valid = (
+        check_sealed_ticket_ordering(
+            sealed_contexts, block_env.base_fee_per_gas
+        )
+    )
+
+    for ctx in sealed_contexts:
+        process_sealed_ticket(ctx, block_env, block_output)

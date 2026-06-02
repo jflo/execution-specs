@@ -55,6 +55,7 @@ class Env:
     excess_blob_gas: Optional[U64]
     requests: Any
     inclusion_list_transactions: Optional[Tuple[Any, ...]]
+    sealed_transaction_contexts: Tuple[Any, ...]
 
     def __init__(self, t8n: "T8N", stdin: Optional[Dict] = None):
         if t8n.options.input_env == "stdin":
@@ -76,6 +77,7 @@ class Env:
         self.read_ommers(data, t8n)
         self.read_withdrawals(data, t8n)
         self.read_inclusion_list_transactions(data, t8n)
+        self.read_sealed_transaction_contexts(data, t8n)
 
         self.parent_beacon_block_root = None
         if t8n.fork.has_beacon_roots_address:
@@ -337,3 +339,57 @@ class Env:
                 inclusion_list_transactions.append(hex_to_bytes(tx))
 
         self.inclusion_list_transactions = tuple(inclusion_list_transactions)
+
+    def read_sealed_transaction_contexts(self, data: Any, t8n: "T8N") -> None:
+        """
+        Read sealed ticket execution contexts for EIP-8184 LUCID.
+
+        Each entry in ``sealedTransactionContexts`` is a JSON object with:
+
+        - ``ticket``: hex-encoded RLP of the SealedTicketTransaction
+        - ``ticketSender``: hex address of the ticket sender
+        - ``plaintextTx``: hex-encoded RLP of the FeeMarketTransaction
+        - ``ciphertextEnvelope``: hex bytes (12-byte nonce + ciphertext+tag)
+        - ``kDem``: hex 32-byte data-encapsulation key
+        - ``commitmentSlot``: hex U64 slot number of the scheduling block
+        - ``commitmentIndex``: hex Uint index in the scheduling block's IL
+        """
+        self.sealed_transaction_contexts = ()
+
+        if not t8n.fork.has_is_sealed_ticket_ordering_valid:
+            return
+
+        if "sealedTransactionContexts" not in data:
+            return
+
+        raw_contexts = data["sealedTransactionContexts"]
+        if not raw_contexts:
+            return
+
+        print(f"Detected {len(raw_contexts)} sealed ticket context(s)")
+
+        ctx_cls = t8n.fork.SealedTransactionContext
+        decode_transaction = t8n.fork.decode_transaction
+
+        contexts = []
+        for entry in raw_contexts:
+            ticket_bytes = hex_to_bytes(entry["ticket"])
+            ticket = decode_transaction(ticket_bytes)
+
+            plaintext_bytes = hex_to_bytes(entry["plaintextTx"])
+            plaintext_tx = decode_transaction(plaintext_bytes)
+
+            ctx = ctx_cls(
+                ticket=ticket,
+                ticket_sender=t8n.fork.hex_to_address(entry["ticketSender"]),
+                plaintext_tx=plaintext_tx,
+                ciphertext_envelope=hex_to_bytes(entry["ciphertextEnvelope"]),
+                k_dem=Bytes32(hex_to_bytes(entry["kDem"])),
+                commitment_slot=parse_hex_or_int(entry["commitmentSlot"], U64),
+                commitment_index=parse_hex_or_int(
+                    entry["commitmentIndex"], Uint
+                ),
+            )
+            contexts.append(ctx)
+
+        self.sealed_transaction_contexts = tuple(contexts)

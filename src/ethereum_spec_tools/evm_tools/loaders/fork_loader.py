@@ -201,6 +201,24 @@ class ForkLoad:
         return hasattr(self.BlockOutput, "is_inclusion_list_satisfied")
 
     @property
+    def has_is_sealed_ticket_ordering_valid(self) -> bool:
+        """
+        Check if the block output has an `is_sealed_ticket_ordering_valid`
+        field (EIP-8184 LUCID).
+        """
+        return hasattr(self.BlockOutput, "is_sealed_ticket_ordering_valid")
+
+    @property
+    def process_sealed_tickets(self) -> Any:
+        """process_sealed_tickets function of the fork (EIP-8184)."""
+        return self._module("fork").process_sealed_tickets
+
+    @property
+    def SealedTransactionContext(self) -> Any:
+        """SealedTransactionContext class of the fork (EIP-8184)."""
+        return self._module("fork").SealedTransactionContext
+
+    @property
     def Block(self) -> Any:
         """Block class of the fork."""
         return self._module("blocks").Block
